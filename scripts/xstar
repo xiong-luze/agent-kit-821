@@ -1,0 +1,49 @@
+#!/bin/sh
+# 开机自启包装脚本 —— 装到 /mnt/UDISK/xstar 即可。
+#
+# 机制：/etc/init.d/S99xstar 开机时会优先执行 /mnt/UDISK/xstar（存在就用它，
+# 否则才跑官方的 /usr/share/xstar/xstar）。而 /usr/bin/daemon.sh 的看护逻辑是
+# `pgrep -f xstar`——本脚本的进程名里就带 xstar，会被匹配到，所以它不会再去
+# 拉起官方那个，也就不会抢声卡。
+#
+# 安装：
+#   adb push xstar /mnt/UDISK/ && adb shell chmod +x /mnt/UDISK/xstar
+#   adb reboot
+# 卸载（恢复官方应用）：
+#   adb shell rm /mnt/UDISK/xstar && adb reboot
+#
+# 日志看这里：/mnt/UDISK/chatbot.log
+
+cd /mnt/UDISK || exit 1
+exec >> /mnt/UDISK/chatbot.log 2>&1
+echo "=================== $(date) 开机自启 ==================="
+
+# 1) 等 WiFi 拿到 IP。S50wifidaemon 会自动重连已保存的 AP，但需要时间；
+#    连不上就退出，让 daemon.sh 30 秒后重新拉起我们重试。
+i=0
+while [ $i -lt 60 ]; do
+    ifconfig wlan0 2>/dev/null | grep -q "inet addr" && break
+    sleep 1
+    i=$((i + 1))
+done
+if ! ifconfig wlan0 2>/dev/null | grep -q "inet addr"; then
+    echo "!! 等了 60 秒 wlan0 仍无 IP，退出等待重试"
+    echo "   （首次使用需先手动配网：wifi -c \"SSID\" \"密码\"）"
+    exit 1
+fi
+echo "WiFi OK: $(ifconfig wlan0 | grep 'inet addr' | awk '{print $2}')"
+
+# 2) 对时。板子无 RTC，冷启动时间回 1970，不对时 TLS 必挂。
+if [ "$(date +%Y)" -lt 2025 ]; then
+    ntpd -q -n -p ntp.aliyun.com || ntpd -q -n -p 203.107.6.88
+fi
+if [ "$(date +%Y)" -lt 2025 ]; then
+    echo "!! 对时失败（$(date)），TLS 会握手失败，退出等待重试"
+    exit 1
+fi
+echo "时间 OK: $(date)"
+
+# 3) 起聊天机器人。exec 让它继承本进程，pgrep -f xstar 仍能匹配到
+#    （命令行里带 /mnt/UDISK 路径），daemon.sh 因此不会拉起官方应用。
+echo "启动 v821_chatbot"
+exec /mnt/UDISK/v821_chatbot

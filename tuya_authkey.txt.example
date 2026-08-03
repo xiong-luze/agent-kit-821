@@ -1,0 +1,18 @@
+# 涂鸦设备许可三元组 —— 在涂鸦 IoT 平台给你的产品申请。
+#
+# 用法：把这个文件拷成 tuya_authkey.txt（已 gitignore）再填真实值。
+# 构建时 CMake 会解析它并生成 build/generated/tuya_authkey.h，
+# 所以真实密钥**永远不出现在任何被提交的源文件里**。
+#
+# 改完这个文件不用手动 reconfigure：CMake 挂了 CMAKE_CONFIGURE_DEPENDS。
+TUYA_UUID=uuidxxxxxxxxxxxxxxxx
+TUYA_AUTH_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TUYA_PRODUCT_KEY=xxxxxxxxxxxxxxxx
+
+# ---- 可选：一台**已激活**设备的凭据，给 --demo-dev 跳过配网用 ----------------
+# 三个都填了 --demo-dev 才可用；不填就只是这个开关不可用，其余照常。
+# 这同样是真实设备的凭据，所以也只放在本文件里，不写进源码。
+# 等价做法：直接传位置参数 ./v821_chatbot <devid> <secret_key> <local_key>
+#DEMO_DEVID=
+#DEMO_SECRET_KEY=
+#DEMO_LOCAL_KEY=
