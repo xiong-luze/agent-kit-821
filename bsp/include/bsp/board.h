@@ -22,11 +22,15 @@
 /* 0 = OK，负数 = 错误 */
 typedef int bsp_err_t;
 #define BSP_OK 0
+/* Sample continuity was lost (e.g. XRUN/suspend). Close and restart BOTH
+ * streams and reset AEC/reference state; never silently resume one stream. */
+#define BSP_ERR_AUDIO_DISCONTINUITY (-1001)
 
 /* 板子有哪些外设（bsp_t.caps 位掩码）。NULL 的表项 = 该板没有这个外设。 */
 #define BSP_CAP_AUDIO   (1u << 0)
 #define BSP_CAP_DISPLAY (1u << 1)
 #define BSP_CAP_CAMERA  (1u << 2)
+#define BSP_CAP_AUDIO_DUPLEX (1u << 3)
 
 typedef struct bsp {
     const char *name;        /* 板名，如 "v821_aitoy" */
@@ -49,6 +53,10 @@ typedef struct bsp {
      * 播放侧和上层之间通常隔着缓冲，写完远早于播完；这个接口负责抹平差异。 */
     void      (*audio_drain)(void);
     void      (*audio_stop)(void);
+    /* Duplex-only: stop queued playback immediately, preserving capture.
+     * pending includes silence as well as speech; both return negative on error. */
+    int       (*audio_flush)(void);
+    int       (*audio_pending)(void);
 
     /* ---- 显示 ----------------------------------------------------------
      * 上层给 RGB565 缓冲，怎么送到屏上（自动扫描 / 手动 pan）是板子的事。 */

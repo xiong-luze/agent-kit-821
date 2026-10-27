@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <time.h>
+#include <errno.h>
 
 #include "lvgl.h"
 #include "bsp/board.h"
@@ -95,17 +97,29 @@ static void *ui_thread(void *arg)
 {
     (void)arg;
     while (g_run) {
-        if (g_ui_qr_on) { usleep(100 * 1000); continue; }   /* 配网二维码占屏中 */
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000000};
+        if (g_ui_qr_on) { nanosleep(&pause, NULL); continue; } /* 配网二维码占屏中 */
+        char status[sizeof(g_status)], user[sizeof(g_user)], ai[sizeof(g_ai)], emo[sizeof(g_emo)];
         pthread_mutex_lock(&g_mtx);
-        if (g_dirty) {
+        int dirty = g_dirty;
+        if (dirty) {
             g_dirty = 0;
-            lv_label_set_text(l_status, g_status);
-            lv_label_set_text(l_user,   g_user);
-            lv_label_set_text(l_ai,     g_ai);
-            if (g_emo[0]) {
+            memcpy(status, g_status, sizeof(status));
+            memcpy(user, g_user, sizeof(user));
+            memcpy(ai, g_ai, sizeof(ai));
+            memcpy(emo, g_emo, sizeof(emo));
+        }
+        pthread_mutex_unlock(&g_mtx);
+        /* Rendering/layout may take longer than an audio period. Never hold the
+         * producer mutex while doing LVGL work: session callbacks also set UI. */
+        if (dirty) {
+            lv_label_set_text(l_status, status);
+            lv_label_set_text(l_user,   user);
+            lv_label_set_text(l_ai,     ai);
+            if (emo[0]) {
                 const lv_img_dsc_t *im = NULL;
                 for (int i = 0; i < EMOJI_TABLE_N; i++)
-                    if (strcmp(EMOJI_TABLE[i].name, g_emo) == 0) {
+                    if (strcmp(EMOJI_TABLE[i].name, emo) == 0) {
                         im = EMOJI_TABLE[i].img; break;
                     }
                 if (im) {
@@ -121,9 +135,9 @@ static void *ui_thread(void *arg)
             if (h > SCR_H - 70 - 6) y = SCR_H - 6 - h;
             lv_obj_align(l_ai, LV_ALIGN_TOP_LEFT, 0, y);
         }
-        pthread_mutex_unlock(&g_mtx);
         lv_timer_handler();
-        usleep(30 * 1000);
+        pause.tv_nsec = 30000000;
+        while (nanosleep(&pause, &pause) && errno == EINTR) {}
     }
     return NULL;
 }

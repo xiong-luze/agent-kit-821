@@ -19,6 +19,13 @@ project(v821_chatbot C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+option(V821_BUILD_HOST_TESTS "Build voice logic tests without credentials/UI/cloud" OFF)
+if(V821_BUILD_HOST_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+    return()
+endif()
+
 # agentic-kit SDK（涂鸦上游）源码位置。默认按 README §2 的目录布局，
 # 也可以 -DAK=<路径> 指定。
 set(AK "$ENV{HOME}/kit/agentic-kit" CACHE PATH "agentic-kit SDK 源码位置")
@@ -30,10 +37,30 @@ if(NOT EXISTS "${AK}/CMakeLists.txt")
 endif()
 set(AK_POSIX   "${AK}/examples/posix")
 set(LVGL_DIR   "${CMAKE_CURRENT_LIST_DIR}/third_party/lvgl")
-set(SPEEX_ROOT "${CMAKE_CURRENT_LIST_DIR}/third_party/speexdsp-install")
+set(SPEEX_ROOT "${CMAKE_CURRENT_LIST_DIR}/third_party/speexdsp-install" CACHE PATH "Target SpeexDSP installation")
 set(JPEG_ROOT  "${CMAKE_CURRENT_LIST_DIR}/third_party/jpeg-install")
 set(PDET_ROOT  "${CMAKE_CURRENT_LIST_DIR}/third_party/pdet")
 set(BOARD      "v821_aitoy" CACHE STRING "编进哪块板（bsp/boards/<BOARD>）")
+set(V821_AUDIO_BACKEND "pipe" CACHE STRING "Audio backend: pipe or alsa")
+set_property(CACHE V821_AUDIO_BACKEND PROPERTY STRINGS pipe alsa)
+set(V821_AEC_BACKEND "speex" CACHE STRING "AEC algorithm: speex or SDK webrtc")
+set_property(CACHE V821_AEC_BACKEND PROPERTY STRINGS speex webrtc)
+set(WEBRTC_AEC_ROOT "" CACHE PATH "SDK aec_lib/webrtc directory with target musl libAec.a")
+if(NOT V821_AEC_BACKEND STREQUAL "speex" AND NOT V821_AEC_BACKEND STREQUAL "webrtc")
+    message(FATAL_ERROR "V821_AEC_BACKEND must be speex or webrtc")
+endif()
+if(V821_AEC_BACKEND STREQUAL "webrtc" AND NOT V821_AUDIO_BACKEND STREQUAL "alsa")
+    message(FATAL_ERROR "SDK WebRTC requires the bounded, in-process ALSA backend")
+endif()
+option(V821_ENABLE_WAKE_WORD "Build local PocketSphinx keyword detection" OFF)
+if(V821_AUDIO_BACKEND STREQUAL "alsa")
+    find_package(ALSA REQUIRED)
+    set(V821_AUDIO_SOURCE "bsp/boards/${BOARD}/audio_pcm.c")
+elseif(V821_AUDIO_BACKEND STREQUAL "pipe")
+    set(V821_AUDIO_SOURCE "bsp/boards/${BOARD}/audio_alsa.c")
+else()
+    message(FATAL_ERROR "V821_AUDIO_BACKEND must be pipe or alsa")
+endif()
 
 # 只要 SDK 的库，不要它自己的测试和 examples
 set(AGENTIC_KIT_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -108,11 +135,17 @@ add_executable(v821_chatbot
     app/main.c
 
     bsp/boards/${BOARD}/board.c
-    bsp/boards/${BOARD}/audio_alsa.c
+    ${V821_AUDIO_SOURCE}
     bsp/boards/${BOARD}/display_fb.c
     bsp/boards/${BOARD}/camera_v4l2.c
 
     core/app.c
+    core/app_config.c
+    core/app_duplex.c
+    core/dialog.c
+    core/echo_guard.c
+    core/pcm_history.c
+    core/wake_word.c
     core/audio_dsp.c
     core/presence.c
     core/ringbuf.c
@@ -120,6 +153,8 @@ add_executable(v821_chatbot
     core/jsonx.c
 
     service/session.c
+    service/audio_uplink.c
+    service/turn_guard.c
     service/provision.c
     service/mcp.c
 
@@ -142,6 +177,24 @@ target_include_directories(v821_chatbot PRIVATE
     "${LVGL_DIR}/lvgl/src/extra/libs/qrcode"
 )
 target_compile_definitions(v821_chatbot PRIVATE LV_CONF_INCLUDE_SIMPLE=1)
+if(V821_AUDIO_BACKEND STREQUAL "alsa")
+    target_compile_definitions(v821_chatbot PRIVATE HAVE_ALSA_PCM=1)
+    target_include_directories(v821_chatbot PRIVATE ${ALSA_INCLUDE_DIRS})
+    target_link_libraries(v821_chatbot PRIVATE ${ALSA_LIBRARIES})
+endif()
+if(V821_ENABLE_WAKE_WORD)
+    set(POCKETSPHINX_ROOT "" CACHE PATH "Target PocketSphinx 5.0.4 installation")
+    find_path(POCKETSPHINX_INCLUDE_DIR pocketsphinx.h PATHS "${POCKETSPHINX_ROOT}/include"
+        NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+    find_library(POCKETSPHINX_LIBRARY NAMES pocketsphinx PATHS "${POCKETSPHINX_ROOT}/lib"
+        NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+    if(NOT POCKETSPHINX_INCLUDE_DIR OR NOT POCKETSPHINX_LIBRARY)
+        message(FATAL_ERROR "V821_ENABLE_WAKE_WORD needs a target PocketSphinx5.0.4 installation")
+    endif()
+    target_include_directories(v821_chatbot SYSTEM PRIVATE "${POCKETSPHINX_INCLUDE_DIR}")
+    target_link_libraries(v821_chatbot PRIVATE "${POCKETSPHINX_LIBRARY}" m)
+    target_compile_definitions(v821_chatbot PRIVATE HAVE_POCKETSPHINX=1)
+endif()
 target_link_libraries(v821_chatbot PRIVATE
     tuya_ai_tcp tuya_iot_client agentic_kit_pal)
 
@@ -159,6 +212,16 @@ if(EXISTS "${JPEG_ROOT}/lib/libturbojpeg.a")
     target_link_libraries(v821_chatbot PRIVATE "${JPEG_ROOT}/lib/libturbojpeg.a")
 else()
     message(FATAL_ERROR "缺少 ${JPEG_ROOT}/lib/libturbojpeg.a（见 README §2）")
+endif()
+
+if(V821_AEC_BACKEND STREQUAL "webrtc")
+    if(NOT EXISTS "${WEBRTC_AEC_ROOT}/include/aec_lib.h" OR
+       NOT EXISTS "${WEBRTC_AEC_ROOT}/library/musl/libAec.a")
+        message(FATAL_ERROR "WEBRTC_AEC_ROOT must contain the SDK target musl library and header")
+    endif()
+    target_compile_definitions(v821_chatbot PRIVATE HAVE_WEBRTC_AEC=1)
+    target_include_directories(v821_chatbot PRIVATE "${WEBRTC_AEC_ROOT}/include")
+    target_link_libraries(v821_chatbot PRIVATE "${WEBRTC_AEC_ROOT}/library/musl/libAec.a" m)
 endif()
 
 # ---- 本地人形检测（可选）-----------------------------------------------------

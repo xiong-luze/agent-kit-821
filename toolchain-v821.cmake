@@ -24,6 +24,8 @@ if(NOT EXISTS "${V821_TOOLCHAIN}/bin/riscv32-linux-musl-gcc")
         "  它在九鼎 SDK 里：prebuilt/rootfsbuilt/riscv/nds32le-linux-musl-v5d.tar.xz（见 README §2）")
 endif()
 
+set(V821_TOOLCHAIN "${V821_TOOLCHAIN}" CACHE PATH "V821 riscv32-musl toolchain directory")
+
 set(CMAKE_C_COMPILER   "${V821_TOOLCHAIN}/bin/riscv32-linux-musl-gcc")
 set(CMAKE_CXX_COMPILER "${V821_TOOLCHAIN}/bin/riscv32-linux-musl-g++")
 set(CMAKE_SYSROOT      "${V821_TOOLCHAIN}/sysroot")

@@ -23,10 +23,32 @@
 static FILE *g_rec  = NULL;      /* NULL = 麦克风已关 */
 static FILE *g_play = NULL;
 static int   g_frame_bytes = 640;   /* 20ms @16k mono 16bit */
+static int   g_play_err_warned = 0; /* 播放出错只报一次，别在 20ms 循环里刷屏 */
+
+/* ★ popen() 只要 fork 成功就返回非 NULL —— aplay 自己打不开声卡它完全不知道，
+ * 报错还是异步打到 stderr 的。症状是「文字一切正常，就是没有声音」，而且没有任何
+ * 一行明确的错误，非常难查（踩过：上一次的进程没退，占着 playback，
+ * aplay 报 "audio open error: Resource busy" 混在几百行云端日志里）。
+ * 所以先用一帧静音探一次，把失败变成启动时就能看见的硬错误。 */
+static int probe_playback(void)
+{
+    int rc = system(BOARD_APLAY_PROBE);
+    if (rc == 0) return 0;
+    fprintf(stderr,
+        "[音频] ✗ 播放设备打不开（aplay 探测失败，rc=%d）\n"
+        "       最常见原因：**上一次的进程还在跑，占着声卡**。\n"
+        "       adb 断开/重启不会杀掉板上的进程，用这条清一下：\n"
+        "         killall v821_chatbot aplay arecord; pgrep -f '[v]821_chatbot|[a]play|[a]record|[x]star'\n"
+        "       其次是官方 xstar 被 daemon.sh 拉起来了（先 kill daemon.sh 再 killall xstar）。\n",
+        rc);
+    return -1;
+}
 
 int board_audio_start(int sample_rate)
 {
     (void)sample_rate;              /* 命令行里写死 16k，与上层约定一致 */
+    if (probe_playback() != 0) return -1;
+
     g_play = popen(BOARD_APLAY_CMD, "w");
     if (!g_play) { fprintf(stderr, "[音频] aplay 启动失败\n"); return -1; }
     g_rec = popen(BOARD_AREC_CMD, "r");
@@ -54,6 +76,12 @@ int board_audio_write(const int16_t *mono, int frames)
     if (!g_play) return -1;
     size_t want = (size_t)frames * sizeof(int16_t);
     fwrite(mono, 1, want, g_play);
+    /* aplay 中途死掉（声卡被抢、underrun 退出）也要说一声，否则又是静默无声。
+     * 只报一次，主循环每 20ms 来一趟，刷屏会把真正的日志埋掉。 */
+    if (ferror(g_play) && !g_play_err_warned) {
+        g_play_err_warned = 1;
+        fprintf(stderr, "[音频] ✗ 播放管道出错（aplay 可能已退出），之后不会有声音\n");
+    }
     return frames;
 }
 

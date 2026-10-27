@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "name": "你好涂鸦 positive",
+      "model_dir": "../../build/wake-deps/mandarin-kws-tuya",
+      "dictionary": "../../build/wake-deps/mandarin-kws-tuya/wake.dict",
+      "phrase": "你好涂鸦",
+      "pcm": "../../build/wake-deps/positive.raw",
+      "expected_hits": 1
+    },
+    {
+      "name": "你好图画 near miss",
+      "model_dir": "../../build/wake-deps/mandarin-kws-tuya",
+      "dictionary": "../../build/wake-deps/mandarin-kws-tuya/wake.dict",
+      "phrase": "你好涂鸦",
+      "pcm": "../../build/wake-deps/near-miss.raw",
+      "expected_hits": 0
+    }
+  ]
+}

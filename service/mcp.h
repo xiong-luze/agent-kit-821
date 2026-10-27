@@ -7,4 +7,6 @@ int  mcp_start(tai_ctx_t *ctx, void (*status_cb)(const char *));
 void mcp_stop(void);
 /* 处理一条 MCP JSON-RPC 请求并应答（在 TAI_EVT_MCP_CMD 里调） */
 void mcp_handle(tai_ctx_t *ctx, const char *json);
+/* Generation is captured at session callback admission, never at photo finish. */
+void mcp_handle_generation(tai_ctx_t *ctx, const char *json, uint64_t generation);
 #endif
