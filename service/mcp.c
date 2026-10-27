@@ -20,6 +20,7 @@
  * 只置个标志立刻返回，真正的拍照上传由 photo 线程做。
  */
 #include "mcp.h"
+#include "session.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,12 +36,15 @@
 #define MCP_NAME    "v821-chatbot"
 #define MCP_VER     "0.1.0"
 
-static tai_ctx_t      *g_ctx = NULL;
-static volatile int    g_photo_req = 0;
-static volatile int    g_quit = 0;
+static int             g_quit = 0;
 static pthread_t       g_thr;
 static int             g_cam_ok = 0;
-static char            g_photo_hint[256];   /* 上传图片时附带的文字 */
+static int             g_started;
+static pthread_mutex_t g_photo_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_photo_cond = PTHREAD_COND_INITIALIZER;
+typedef struct { char hint[256]; uint64_t generation; } photo_request_t;
+static photo_request_t g_pending_photo;
+static int             g_photo_pending;
 static void (*g_status_cb)(const char *) = NULL;
 
 /* 注：这版 SDK 没有逐轮设置事件参数的接口（只有 tai_config_t 里静态的
@@ -51,34 +55,45 @@ static void (*g_status_cb)(const char *) = NULL;
 static void *photo_thread(void *arg)
 {
     (void)arg;
-    while (!g_quit) {
-        if (!g_photo_req) { usleep(50 * 1000); continue; }
-        g_photo_req = 0;
-
-        if (!g_cam_ok) {
-            fprintf(stderr, "[MCP] 相机不可用，跳过拍照\n");
-            continue;
-        }
-        if (g_status_cb) g_status_cb("拍照中...");
-
+    for (;;) {
+        pthread_mutex_lock(&g_photo_mutex);
+        while (!g_quit && !g_photo_pending) pthread_cond_wait(&g_photo_cond, &g_photo_mutex);
+        if (g_quit) { pthread_mutex_unlock(&g_photo_mutex); break; }
+        photo_request_t request = g_pending_photo;
+        g_photo_pending = 0;
+        pthread_mutex_unlock(&g_photo_mutex);
+        if (!session_generation_is_current(request.generation)) continue;
+        if (request.generation) session_status_for_generation(request.generation, "拍照中...");
+        else if (g_status_cb) g_status_cb("拍照中...");
         const uint8_t *jpg = NULL; size_t len = 0; int w = 0, h = 0;
         if (bsp_get()->camera_capture_jpeg(&jpg, &len, &w, &h) != 0) {
-            if (g_status_cb) g_status_cb("拍照失败");
+            if (request.generation) session_status_for_generation(request.generation, "拍照失败");
+            else if (g_status_cb) g_status_cb("拍照失败");
             continue;
         }
-
-        /* 图片走图像通道上传。text 是给云端的提示语。 */
-        const char *hint = g_photo_hint[0] ? g_photo_hint : "看看这是什么";
-        int rc = tai_send_image_with_text(g_ctx, hint, strlen(hint),
-                                          jpg, len, TAI_IMG_JPEG,
-                                          (uint16_t)w, (uint16_t)h);
+        pthread_mutex_lock(&g_photo_mutex);
+        int quitting = g_quit;
+        pthread_mutex_unlock(&g_photo_mutex);
+        if (quitting) continue;
+        if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) {
+            fprintf(stderr, "[MCP] 相机返回无效尺寸\n");
+            continue;
+        }
+        const char *hint = request.hint[0] ? request.hint : "看看这是什么";
+        /* This may wait behind an open audio event, but never on the audio
+         * thread. The session checks this captured generation again afterwards. */
+        int rc = session_send_photo_for_generation(request.generation, hint, jpg, len,
+                                                    (uint16_t)w, (uint16_t)h);
+        if (rc == SESSION_PHOTO_CANCELED) continue;
         if (rc != TAI_OK) {
             fprintf(stderr, "[MCP] 图片上传失败：%d\n", rc);
-            if (g_status_cb) g_status_cb("图片上传失败");
+            if (request.generation) session_status_for_generation(request.generation, "图片上传失败");
+            else if (g_status_cb) g_status_cb("图片上传失败");
         } else {
             printf("[MCP] 图片已上传（%u 字节，提示语「%s」）\n",
                    (unsigned)len, hint);
-            if (g_status_cb) g_status_cb("图片已上传，等待理解...");
+            if (request.generation) session_status_for_generation(request.generation, "图片已上传，等待理解...");
+            else if (g_status_cb) g_status_cb("图片已上传，等待理解...");
         }
     }
     return NULL;
@@ -86,29 +101,51 @@ static void *photo_thread(void *arg)
 
 int mcp_start(tai_ctx_t *ctx, void (*status_cb)(const char *))
 {
-    g_ctx = ctx;
+    (void)ctx;
+    pthread_mutex_lock(&g_photo_mutex);
+    int already_started = g_started;
+    pthread_mutex_unlock(&g_photo_mutex);
+    if (already_started) return -1;
     g_status_cb = status_cb;
     /* 640x480 足够多模态理解，又不至于让 rv32 软编码太慢。
      * 走 bsp，不直接碰 V4L2 —— 换相机后端只改 bsp/boards/。 */
     const bsp_t *b = bsp_get();
-    g_cam_ok = (b->camera_start && b->camera_start(640, 480) == 0);
-    if (!g_cam_ok)
+    int camera_ok = (b->camera_start && b->camera_start(640, 480) == 0);
+    if (!camera_ok)
         fprintf(stderr, "[MCP] 相机初始化失败 —— take_photo 工具仍会注册，"
                         "但调用时会返回失败\n");
-    g_quit = 0;
+    pthread_mutex_lock(&g_photo_mutex);
+    g_cam_ok = camera_ok;
+    g_quit = g_photo_pending = 0;
+    pthread_mutex_unlock(&g_photo_mutex);
     if (pthread_create(&g_thr, NULL, photo_thread, NULL) != 0) {
         fprintf(stderr, "[MCP] 拍照线程创建失败\n");
+        if (g_cam_ok) b->camera_stop();
+        pthread_mutex_lock(&g_photo_mutex);
+        g_cam_ok = 0;
+        pthread_mutex_unlock(&g_photo_mutex);
         return -1;
     }
+    pthread_mutex_lock(&g_photo_mutex);
+    g_started = 1;
+    pthread_mutex_unlock(&g_photo_mutex);
     printf("[MCP] 已注册工具：take_photo%s\n", g_cam_ok ? "" : "（相机不可用）");
     return 0;
 }
 
 void mcp_stop(void)
 {
+    pthread_mutex_lock(&g_photo_mutex);
+    if (!g_started) { pthread_mutex_unlock(&g_photo_mutex); return; }
     g_quit = 1;
+    g_photo_pending = 0;
+    pthread_cond_broadcast(&g_photo_cond);
+    pthread_mutex_unlock(&g_photo_mutex);
     pthread_join(g_thr, NULL);
     if (g_cam_ok) bsp_get()->camera_stop();
+    pthread_mutex_lock(&g_photo_mutex);
+    g_cam_ok = g_started = 0;
+    pthread_mutex_unlock(&g_photo_mutex);
 }
 
 /* -- 协议应答 ------------------------------------------------------------ */
@@ -125,7 +162,7 @@ static const char *TOOLS_JSON =
       "},\"required\":[]}"
     "}";
 
-void mcp_handle(tai_ctx_t *ctx, const char *json)
+void mcp_handle_generation(tai_ctx_t *ctx, const char *json, uint64_t generation)
 {
     if (!json) return;
 
@@ -165,21 +202,27 @@ void mcp_handle(tai_ctx_t *ctx, const char *json)
         if (params) json_get_string(params, "name", name, sizeof(name));
 
         if (strcmp(name, "take_photo") == 0) {
-            g_photo_hint[0] = '\0';
+            photo_request_t request = {.generation = generation};
             if (params) {
                 char *args = json_get_object(params, "arguments");
                 if (args) {
-                    json_get_string(args, "hint", g_photo_hint, sizeof(g_photo_hint));
+                    json_get_string_esc(args, "hint", request.hint, sizeof(request.hint));
                     free(args);
                 }
             }
-            printf("[MCP] 大模型请求拍照%s%s\n",
-                   g_photo_hint[0] ? "，提示语：" : "", g_photo_hint);
-            g_photo_req = 1;          /* 交给 photo 线程，立刻返回不阻塞 */
+            pthread_mutex_lock(&g_photo_mutex);
+            int accepted = g_started && g_cam_ok && !g_quit && !g_photo_pending;
+            if (accepted) {
+                g_pending_photo = request;
+                g_photo_pending = 1;
+                pthread_cond_signal(&g_photo_cond);
+            }
+            pthread_mutex_unlock(&g_photo_mutex);
             snprintf(resp, sizeof(resp),
                 "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":"
-                "[{\"type\":\"text\",\"text\":\"已拍照，图片正在上传，"
-                "请根据随后收到的图片回答\"}],\"isError\":false}}", idbuf);
+                "[{\"type\":\"text\",\"text\":\"%s\"}],\"isError\":%s}}", idbuf,
+                accepted ? "拍照任务已接收，图片完成后将上传，请等待随后图片" : "相机忙或不可用，请稍后重试",
+                accepted ? "false" : "true");
         } else {
             snprintf(resp, sizeof(resp),
                 "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":"
@@ -189,7 +232,7 @@ void mcp_handle(tai_ctx_t *ctx, const char *json)
         if (params) free(params);
 
     } else {
-        /* notifications/* 之类不需要结果，回个空 result 保持兼容 */
+        /* notifications/ 下的方法不需要结果，回个空 result 保持兼容 */
         snprintf(resp, sizeof(resp),
             "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":"
             "[{\"type\":\"text\",\"text\":\"\"}]}}", idbuf);
@@ -197,4 +240,9 @@ void mcp_handle(tai_ctx_t *ctx, const char *json)
 
     if (tai_send_mcp_response(ctx, resp) != TAI_OK)
         fprintf(stderr, "[MCP] 应答发送失败（method=%s）\n", method);
+}
+
+void mcp_handle(tai_ctx_t *ctx, const char *json)
+{
+    mcp_handle_generation(ctx, json, 0);
 }

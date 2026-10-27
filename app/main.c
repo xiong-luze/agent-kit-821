@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <errno.h>
 
 #include "bsp/board.h"
 #include "iot_client.h"
@@ -46,12 +48,24 @@ static int envi_ms(const char *k, int def)
     return v ? atoi(v) : def;
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
 static void usage(const char *p)
 {
     printf("用法：%s [devid secret_key local_key]\n", p);
     printf("  --tune       只打印麦克风电平，用来定 VAD 阈值\n");
     printf("  --pdet-tune  只跑人形检测并打印单帧耗时（定采样间隔用）\n");
     printf("  --no-aec     关软件 AEC（播放期间仍会物理关麦）\n");
+    printf("  --full-duplex 持续采集+AEC+本地打断（需要alsa后端）\n");
+    printf("  --half-duplex 使用原一问一答回退\n");
+    printf("  --wake-word 短语  本地唤醒词，默认你好涂鸦\n");
+    printf("  --wake-model 目录 --wake-dict 词典  本地中文模型资源\n");
+    printf("  --no-wake    全双工只用VAD，不等待唤醒词（AEC联调用）\n");
     printf("  --no-greet   关掉「看到有人主动打招呼」\n");
     printf("  --greet-only 关掉声音触发，只留主动打招呼（吵闹环境下验证用）\n");
     printf("  --reprov     清掉凭据存档，重新扫码配网\n");
@@ -68,33 +82,64 @@ int main(int argc, char *argv[])
 
     app_cfg_t cfg;
     app_cfg_defaults(&cfg);
-    int tune = 0, pdet_tune = 0, reprov = 0, demo_dev = 0;
+    int tune = 0, pdet_tune = 0, reprov = 0, demo_dev = 0, wake_requested = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--tune"))      tune = 1;
-        if (!strcmp(argv[i], "--pdet-tune")) pdet_tune = 1;
-        if (!strcmp(argv[i], "--no-aec"))    cfg.aec_enable = 0;
-        if (!strcmp(argv[i], "--no-greet"))  cfg.greet_enable = 0;
-        if (!strcmp(argv[i], "--greet-only")) cfg.voice_trigger = 0;
-        if (!strcmp(argv[i], "--reprov"))   reprov = 1;
-        if (!strcmp(argv[i], "--demo-dev")) demo_dev = 1;
+        if (i == 1 && argc >= 4 && argv[1][0] != '-') { i = 3; continue; }
+        if (!strcmp(argv[i], "--full-duplex")) { cfg.full_duplex = 1; continue; }
+        if (!strcmp(argv[i], "--half-duplex")) { cfg.full_duplex = 0; continue; }
+        if (!strcmp(argv[i], "--no-wake")) { cfg.wake_enabled = 0; continue; }
+        if (!strcmp(argv[i], "--wake-word") || !strcmp(argv[i], "--wake-model") ||
+            !strcmp(argv[i], "--wake-dict")) {
+            const char *key = argv[i];
+            if (++i >= argc) { fprintf(stderr, "缺少%s参数\n", key); return 1; }
+            if (!strcmp(key, "--wake-word")) cfg.wake_word = argv[i];
+            else if (!strcmp(key, "--wake-model")) cfg.wake_model = argv[i];
+            else cfg.wake_dictionary = argv[i];
+            wake_requested = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--tune"))      { tune = 1; continue; }
+        if (!strcmp(argv[i], "--pdet-tune")) { pdet_tune = 1; continue; }
+        if (!strcmp(argv[i], "--no-aec"))    { cfg.aec_enable = 0; continue; }
+        if (!strcmp(argv[i], "--no-greet"))  { cfg.greet_enable = 0; continue; }
+        if (!strcmp(argv[i], "--greet-only")) { cfg.voice_trigger = 0; continue; }
+        if (!strcmp(argv[i], "--reprov"))   { reprov = 1; continue; }
+        if (!strcmp(argv[i], "--demo-dev")) { demo_dev = 1; continue; }
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
+        fprintf(stderr, "未知参数：%s\n", argv[i]);
+        return 1;
     }
+    if (wake_requested && !cfg.full_duplex) {
+        fprintf(stderr, "自定义唤醒词需同时启用 --full-duplex\n"); return 1;
+    }
+    if (app_cfg_validate(&cfg)) return 1;
 
     const bsp_t *b = bsp_get();
+    if (cfg.full_duplex && !(b->caps & BSP_CAP_AUDIO_DUPLEX)) {
+        fprintf(stderr, "请使用 -DV821_AUDIO_BACKEND=alsa 构建全双工版本\n");
+        return 1;
+    }
     printf("[板级] %s\n", b->name);
     if (b->init && b->init() != BSP_OK) { fprintf(stderr, "板级初始化失败\n"); return 1; }
 
     ui_start();                    /* 屏幕不可用也继续跑，只是没画面 */
     ui_set_status("启动中...");
 
-    if (b->audio_start(cfg.sample_rate) != BSP_OK) {
-        fprintf(stderr, "音频启动失败\n"); return 1;
-    }
     int frame_samples = cfg.sample_rate * cfg.frame_ms / 1000;
-    dsp_init(cfg.sample_rate, frame_samples, cfg.aec_tail_ms, cfg.aec_enable);
-    ringbuf_init(cfg.sample_rate, 40);
+    if (dsp_init(cfg.sample_rate, frame_samples, cfg.aec_tail_ms, cfg.aec_enable) && cfg.full_duplex) {
+        fprintf(stderr, "全双工AEC初始化失败\n"); return 1;
+    }
+    if (ringbuf_init(cfg.sample_rate, 40)) {
+        fprintf(stderr, "播放缓冲内存分配失败\n"); return 1;
+    }
 
-    if (tune) { app_tune(&cfg); return 0; }
+    if (tune) {
+        if (b->audio_start(cfg.sample_rate) != BSP_OK) return 1;
+        app_tune(&cfg);
+        b->audio_stop();
+        dsp_deinit();
+        return 0;
+    }
 
     /* 人形检测跑分：不连云，只要相机。单帧耗时决定采样间隔能设多小。 */
     if (pdet_tune) {
@@ -154,18 +199,59 @@ int main(int argc, char *argv[])
         .on_ai_text   = ui_ai_append,
         .on_emotion   = ui_set_emotion,
         .on_status    = ui_set_status,
+        .on_turn_begin = ui_ai_begin,
     };
-    if (session_connect(devid, sk, lk, &sui) != 0) return 1;
+    int result = 0;
+    unsigned retry_delay_s = 1, retry_attempt = 0, audio_rebuilds = 0;
+    for (;;) {
+        if (session_connect(devid, sk, lk, &sui) != 0) {
+            /* Connect can fail after allocating IoT/TLS resources. */
+            session_close();
+            result = -1;
+            if (!cfg.full_duplex) break;
+        } else {
+            retry_delay_s = 1;
+            mcp_start(session_ctx(), ui_set_status);
+            int64_t run_started_ms = monotonic_ms();
+            if (cfg.full_duplex)
+                result = dsp_reset() ? APP_DUPLEX_ERROR : app_run_duplex(&cfg);
+            else if (b->audio_start(cfg.sample_rate) != BSP_OK) result = -1;
+            else app_run(&cfg);
+            int64_t run_ended_ms = monotonic_ms();
+            if (run_started_ms >= 0 && run_ended_ms - run_started_ms >= 30000)
+                audio_rebuilds = 0;
+            if (cfg.full_duplex && result == APP_DUPLEX_REBUILD_AUDIO) {
+                int allowed = audio_rebuilds < 3;
+                fprintf(stderr, "[音频恢复诊断] recent_rebuilds=%u allowed=%d\n", audio_rebuilds, allowed);
+                if (allowed) audio_rebuilds++;
+                else {
+                    result = APP_DUPLEX_ERROR;
+                    ui_set_status("音频连续异常，请检查设备");
+                }
+            }
 
-    mcp_start(session_ctx(), ui_set_status);   /* 注册 take_photo 等设备工具 */
+            /* Audio already stopped before its sender was joined. Retire all
+             * old callbacks/photo work before replacing the SDK context. */
+            mcp_stop();
+            session_close();
+            if (!cfg.full_duplex || (result != APP_DUPLEX_RECONNECT && result != APP_DUPLEX_REBUILD_AUDIO)) break;
+        }
+        ringbuf_clear();
+        ui_set_status(result == APP_DUPLEX_REBUILD_AUDIO ? "音频中断，恢复中..." : "网络连接中断，重连中...");
+        fprintf(stderr, "[重连诊断] attempt=%u delay_s=%u cause=%d\n",
+                ++retry_attempt, retry_delay_s, result);
+        struct timespec pause = {.tv_sec = retry_delay_s, .tv_nsec = 0};
+        while (nanosleep(&pause, &pause) && errno == EINTR) {}
+        if (retry_delay_s < 5) {
+            retry_delay_s *= 2;
+            if (retry_delay_s > 5) retry_delay_s = 5;
+        }
+    }
 
-    app_run(&cfg);                             /* 断线才返回 */
-
-    mcp_stop();
-    session_close();
+    ringbuf_free();
     dsp_deinit();
     ui_stop();
     b->audio_stop();
     if (b->display_stop) b->display_stop();
-    return 0;
+    return result ? 1 : 0;
 }

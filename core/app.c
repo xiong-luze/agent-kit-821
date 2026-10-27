@@ -31,6 +31,8 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <time.h>
+#include <errno.h>
 
 #define MAX_TURN_MS    15000   /* 单轮说话上限，纯保险 */
 #define REPLY_WAIT_MS  30000   /* 等云端回答上限 */
@@ -46,30 +48,15 @@
 
 static int64_t now_ms(void)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    struct timespec tv;
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000000;
 }
 
-static int envi(const char *k, int def)
+static void wait_ms(int milliseconds)
 {
-    const char *v = getenv(k);
-    return v ? atoi(v) : def;
-}
-
-void app_cfg_defaults(app_cfg_t *c)
-{
-    c->sample_rate = 16000;
-    c->frame_ms    = 20;
-    c->vad_start   = envi("V821_VAD_START", 0);     /* 0 = 自动标定 */
-    c->vad_end     = envi("V821_VAD_END",   0);
-    c->vad_hang_ms = envi("V821_VAD_HANG",  1000);
-    c->guard_ms    = envi("V821_GUARD_MS",  300);
-    c->aec_tail_ms = envi("V821_AEC_TAIL",  300);
-    c->aec_enable  = 1;
-    c->greet_enable  = envi("V821_GREET", 1);
-    c->greet_idle_ms = envi("V821_GREET_IDLE_MS", 60000);
-    c->voice_trigger = envi("V821_VOICE_TRIGGER", 1);
+    struct timespec duration = {milliseconds / 1000, (milliseconds % 1000) * 1000000L};
+    while (nanosleep(&duration, &duration) && errno == EINTR) {}
 }
 
 void app_tune(const app_cfg_t *c)
@@ -88,7 +75,7 @@ void app_tune(const app_cfg_t *c)
 
 /* 开机静听量底噪。必须走与判定完全相同的管道（AEC+降噪），
  * 且丢掉前 0.5 秒等降噪收敛——否则阈值会虚高好几倍。 */
-static void calibrate(const app_cfg_t *c, int fs,
+static int calibrate(int fs,
                       int16_t *mic, int16_t *zero, int16_t *out,
                       int *vad_start, int *vad_end)
 {
@@ -98,24 +85,27 @@ static void calibrate(const app_cfg_t *c, int fs,
     for (int w = 0; w < 25; w++) {              /* 前 0.5 秒丢弃 */
         if (b->audio_read(mic, fs) != fs) break;
         b->audio_write(zero, fs);
-        dsp_process(mic, zero, out);
+        if (dsp_process(mic, zero, out)) return -1;
     }
     vad_cal_begin();
     for (int n = 0; n < 75; n++) {
         if (b->audio_read(mic, fs) != fs) break;
         b->audio_write(zero, fs);
-        dsp_process(mic, zero, out);
+        if (dsp_process(mic, zero, out)) return -1;
         vad_cal_feed(dsp_rms(out, fs));
     }
     vad_thresh_t t = vad_cal_end(25, 16);       /* 底噪 ×2.5 / ×1.6 */
     if (*vad_start <= 0) *vad_start = t.start;
     if (*vad_end   <= 0) *vad_end   = t.end;
+    return 0;
 }
 
 void app_run(const app_cfg_t *c)
 {
     const bsp_t *b = bsp_get();
-    const session_state_t *ss = session_state();
+    session_state_t snapshot;
+    const session_state_t *ss = &snapshot;
+    session_snapshot(&snapshot);
 
     int fs = c->sample_rate * c->frame_ms / 1000;
     int16_t *mic  = (int16_t *)calloc((size_t)fs, sizeof(int16_t));
@@ -125,8 +115,11 @@ void app_run(const app_cfg_t *c)
     if (!mic || !ref || !out || !zero) return;
 
     int vad_start = c->vad_start, vad_end = c->vad_end;
-    if (vad_start <= 0 || vad_end <= 0)
-        calibrate(c, fs, mic, zero, out, &vad_start, &vad_end);
+    if ((vad_start <= 0 || vad_end <= 0) &&
+        calibrate(fs, mic, zero, out, &vad_start, &vad_end)) {
+        free(mic); free(ref); free(out); free(zero);
+        return;
+    }
     printf("[VAD] 起说话=%d 结束=%d（静音判定 %dms）\n",
            vad_start, vad_end, c->vad_hang_ms);
 
@@ -154,13 +147,15 @@ void app_run(const app_cfg_t *c)
     ui_set_status(c->voice_trigger ? "请说话" : "等人靠近");
 
     while (!ss->lost) {
+        session_snapshot(&snapshot);
+        if (ss->lost) break;
         if (b->audio_read(mic, fs) != fs) break;
 
         /* 聆听/上送阶段不播内容，但仍要每帧喂静音给播放侧保持不断流。 */
         memset(ref, 0, (size_t)fs * sizeof(int16_t));
         b->audio_write(ref, fs);
 
-        dsp_process(mic, ref, out);
+        if (dsp_process(mic, ref, out)) goto done;
         int rms = dsp_rms(out, fs);
 
         switch (st) {
@@ -240,8 +235,10 @@ void app_run(const app_cfg_t *c)
                 b->audio_mic_set(0);          /* 物理关麦，见文件头 ① */
 
                 while (!ss->lost) {
+                    session_snapshot(&snapshot);
+                    if (ss->lost) break;
                     if (ringbuf_pop_frame(ref, (size_t)fs) > 0) {
-                        b->audio_write(ref, fs);
+                        if (b->audio_write(ref, fs) != fs) goto done;
                     } else if (ss->turn_done &&
                                now_ms() - ss->last_audio_ms > TAIL_QUIET_MS) {
                         break;                /* 真的没有后续了，见文件头 ② */
@@ -250,11 +247,19 @@ void app_run(const app_cfg_t *c)
                         printf("\n[播放] 等后续音频超时\n");
                         break;
                     } else {
-                        usleep(5000);         /* 等网络补数据 */
+                        if (b->caps & BSP_CAP_AUDIO_DUPLEX) {
+                            /* Direct ALSA has only a few periods queued. Keep
+                             * its clock fed across network/MCP gaps. */
+                            if (b->audio_write(zero, fs) != fs) goto done;
+                        } else wait_ms(5);
                     }
                 }
                 b->audio_drain();             /* 阻塞到真正播完 */
-                usleep((useconds_t)c->guard_ms * 1000);   /* 等房间混响散尽 */
+                if (b->caps & BSP_CAP_AUDIO_DUPLEX) {
+                    int frames = (c->guard_ms + c->frame_ms - 1) / c->frame_ms;
+                    for (int i = 0; i < frames; i++)
+                        if (b->audio_write(zero, fs) != fs) goto done;
+                } else wait_ms(c->guard_ms);   /* 等房间混响散尽 */
                 b->audio_mic_set(1);
 
                 printf("[开麦] 播放结束\n\n[聆听] ...\n");

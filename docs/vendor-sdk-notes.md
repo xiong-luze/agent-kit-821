@@ -69,17 +69,19 @@
 `middleware/sun300iw1/media/LIBRARY/aec_lib/`）。板级 dts 的 codec 节点里
 **没有任何 aec/echo 相关属性**，印证了这一点。
 
-所以官方相对我们的优势只有一个：**AO 和 AI 在同一个 MPP 进程里，参考信号能精确时间
-对齐**（`sample_ao2ai_aec` 演示的就是这个环路）。
+MPP可在同一音频链路中提供采音与播放参考，仍需要实测对齐、延时和漂移。
+旧记录曾将`MAX_DELAY`宏直接解释为毫秒上限，并用管道容量代替固定声学延时；
+该解释不足以支持量程结论。当前采用进程内小缓冲I/O，按实际排队深度估算延时。
 
 ### 两条路的取舍
 
 | 路线 | 说明 |
 |---|---|
-| **A. 进程内 ALSA + `aec_lib` 里的预编译 WebRTC AEC** | `aec_lib/webrtc/library/musl/` 下那个静态库**就是 riscv32 + musl**（用工具链的 objdump 验过），不用重编固件、不用刷机就能链。板上有 `libasound`（官方应用就是链它的）。**难点是延时估计**：那个 API 要传"声卡+系统缓冲延时(ms)"，而它的量程只有 100ms 级，arecord/aplay 之间的 64KB 管道缓冲约 2000ms，超量程 20 倍 —— 所以必须先把音频 I/O 换成进程内，换算法库解决不了 |
+| **A. 进程内 ALSA + SDK WebRTC AEC** | `aec_lib/webrtc/library/musl/`静态库已验证目标为riscv32 + musl，可与进程内ALSA链接。当前实现记录实际播放排队深度并估计参考延时；仍需在目标硬件验证真实声学对齐与双讲质量。库和头文件需开发者自行从合法取得的SDK准备，不随本仓库分发 |
 | **B. 走 MPP AO/AI** | MPP 是**全静态链接**（见 `chatbox/xiaozhi/mpp_config.mk` 的静态库列表），板上没有对应 `.so` 可蹭 —— 这也解释了为什么固件的 `/usr/lib/eyesee-mpp/` 几乎是空的。必须先跑一遍 SDK 构建把 staging 里的 `.a` 生成出来（15–25G 磁盘）。生成完可以用我们自己的 CMake 链，**不一定要刷机**，除非同时要改 dts |
 
-**先做 A**，风险和成本都低得多。
+A路线已作为可选`V821_AEC_BACKEND=webrtc`接入。原半双工及Speex构建保留，
+配置、恢复策略和验证范围见[全双工开发说明](voice-aec-wakeword.md)。
 
 ---
 

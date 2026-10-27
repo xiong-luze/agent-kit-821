@@ -22,3 +22,26 @@ third_party/libjpeg-turbo-2.1.1/
 third_party/jpeg-install/
 # 人形检测：全志预编译库 + 其头文件，从 SDK 拷（README §2），带厂商版权不入库
 third_party/pdet/
+
+# --- 本地配置、凭据与诊断数据（不发布）---------------------------------------
+tuya_creds.txt
+tuya_authkey.h
+voice_duplex.env
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+*.log
+*.raw
+*.pcm
+*.wav
+*.so
+*.so.*
+*.dylib
+*.elf
+*.img
+dist*/
+__pycache__/
+*.py[cod]

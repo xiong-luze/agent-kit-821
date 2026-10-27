@@ -2,6 +2,11 @@
 #include "audio_dsp.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
+#ifdef HAVE_WEBRTC_AEC
+#include <aec_lib.h>
+static void *g_vendor;
+#endif
 
 #include "speex/speex_echo.h"
 #include "speex/speex_preprocess.h"
@@ -25,55 +30,114 @@ int dsp_rms(const int16_t *pcm, int n)
     return (int)r;
 }
 
+static int g_delay_ms = 60;
+static int g_failed;
+
+#ifdef HAVE_WEBRTC_AEC
+static int vendor_configure(int rate)
+{
+    AecConfig config = {0};
+    config.nlpMode = kAecNlpModerate;
+    return WebRtcAec_Init(g_vendor, rate, rate) ||
+           WebRtcAec_set_config(g_vendor, config) ? -1 : 0;
+}
+#endif
+
 int dsp_init(int sample_rate, int frame_samples, int tail_ms, int enable)
 {
+    dsp_deinit();
+    if (sample_rate <= 0 || frame_samples <= 0 || tail_ms <= 0) return -1;
     g_frame = frame_samples;
+    g_failed = 0;
+    g_delay_ms = 60;
     if (!enable) {
-        printf("[AEC] 已禁用，播放期间靠物理关麦防回声\n");
-        g_on = 0;
+        puts("[AEC] 已禁用，播放期间靠物理关麦防回声");
         return 0;
     }
+#ifdef HAVE_WEBRTC_AEC
+    if (sample_rate != 16000 || frame_samples > 320 || frame_samples % 160 ||
+        WebRtcAec_Create(&g_vendor) || !g_vendor || vendor_configure(sample_rate)) goto fail;
+#else
     int filter_len = sample_rate * tail_ms / 1000;
     g_echo = speex_echo_state_init(frame_samples, filter_len);
-    if (!g_echo) {
-        fprintf(stderr, "[AEC] 初始化失败，退回物理关麦\n");
-        g_on = 0;
-        return -1;
-    }
-    int rate = sample_rate;
-    speex_echo_ctl(g_echo, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
+    if (!g_echo || speex_echo_ctl(g_echo, SPEEX_ECHO_SET_SAMPLING_RATE, &sample_rate)) goto fail;
+#endif
     g_pre = speex_preprocess_state_init(frame_samples, sample_rate);
-    if (g_pre) {
-        int on = 1, off = 0;
-        speex_preprocess_ctl(g_pre, SPEEX_PREPROCESS_SET_DENOISE, &on);
-        /* AGC 必须关：mixer 里已经加了 +30dB 数字增益，再叠自动增益会把底噪
-         * 和 AEC 残留一起顶上来（全志 AEC 文档 §4.6 也警告增益过大伤 AEC）。 */
-        speex_preprocess_ctl(g_pre, SPEEX_PREPROCESS_SET_AGC, &off);
-        speex_preprocess_ctl(g_pre, SPEEX_PREPROCESS_SET_ECHO_STATE, g_echo);
-    }
+    if (!g_pre) goto fail;
+    int on = 1, off = 0;
+    if (speex_preprocess_ctl(g_pre, SPEEX_PREPROCESS_SET_DENOISE, &on) ||
+        speex_preprocess_ctl(g_pre, SPEEX_PREPROCESS_SET_AGC, &off)) goto fail;
+#ifndef HAVE_WEBRTC_AEC
+    if (speex_preprocess_ctl(g_pre, SPEEX_PREPROCESS_SET_ECHO_STATE, g_echo)) goto fail;
     printf("[AEC] speex 已启用：帧 %d 样本，滤波器 %d 样本(%dms)\n",
            frame_samples, filter_len, tail_ms);
+#else
+    puts("[AEC] SDK WebRTC 已启用：160样本分块，moderate NLP，Speex降噪开启，AGC关闭");
+#endif
     g_on = 1;
     return 0;
+fail:
+    fputs("[AEC] 初始化失败，未启用音频处理\n", stderr);
+    dsp_deinit();
+    g_failed = 1;
+    return -1;
 }
 
 void dsp_deinit(void)
 {
-    if (g_pre)  { speex_preprocess_state_destroy(g_pre);  g_pre  = NULL; }
+    if (g_pre) { speex_preprocess_state_destroy(g_pre); g_pre = NULL; }
     if (g_echo) { speex_echo_state_destroy(g_echo); g_echo = NULL; }
+#ifdef HAVE_WEBRTC_AEC
+    if (g_vendor) { WebRtcAec_Free(g_vendor); g_vendor = NULL; }
+#endif
     g_on = 0;
+    g_failed = 0;
 }
 
-int dsp_enabled(void) { return g_on; }
+int dsp_enabled(void) { return g_on && !g_failed; }
 
-void dsp_process(const int16_t *mic, const int16_t *ref, int16_t *out)
+int dsp_set_delay(int milliseconds)
 {
-    if (!g_on || !g_echo) {
-        memcpy(out, mic, (size_t)g_frame * sizeof(int16_t));
-        return;
+    if (milliseconds < 0 || milliseconds > 500) return -1;
+    g_delay_ms = milliseconds;
+    return 0;
+}
+
+int dsp_reset(void)
+{
+    if (g_failed) return -1;
+    if (!g_on) return 0;
+#ifdef HAVE_WEBRTC_AEC
+    if (vendor_configure(16000)) { g_failed = 1; return -1; }
+#else
+    speex_echo_state_reset(g_echo);
+#endif
+    return 0;
+}
+
+int dsp_process(const int16_t *mic, const int16_t *ref, int16_t *out)
+{
+    if (!mic || !ref || !out || g_failed) return -1;
+    if (!g_on) {
+        memcpy(out, mic, (size_t)g_frame * sizeof(*out));
+        return 0;
     }
+#ifdef HAVE_WEBRTC_AEC
+    for (int at = 0; at < g_frame; at += 160) {
+        if (WebRtcAec_BufferFarend(g_vendor, ref + at, 160) ||
+            WebRtcAec_Process(g_vendor, mic + at, NULL, out + at, NULL,
+                              160, (int16_t)g_delay_ms, 0)) {
+            memset(out, 0, (size_t)g_frame * sizeof(*out));
+            g_failed = 1;
+            fputs("[AEC] SDK处理失败，停止对话采播\n", stderr);
+            return -1;
+        }
+    }
+#else
     speex_echo_cancellation(g_echo, mic, ref, out);
-    if (g_pre) speex_preprocess_run(g_pre, out);
+#endif
+    speex_preprocess_run(g_pre, out);
+    return 0;
 }
 
 /* -- VAD 标定 ------------------------------------------------------------ */

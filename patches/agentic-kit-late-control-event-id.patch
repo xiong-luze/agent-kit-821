@@ -1,0 +1,59 @@
+--- a/modules/rtc-tcp-client/src/tai_protocol.c
++++ b/modules/rtc-tcp-client/src/tai_protocol.c
+@@ -459,6 +459,7 @@
+ /* Latch the turn id (attr 61) into ctx->rx_event_id to back msg->event_id.
+  * A packet that carries attr 61 updates it; a packet WITHOUT one INHERITS the
+- * current value (it is NOT reset to ""). The EVENT case clears it right after
+- * firing EVT_END, and tai_disconnect clears it on teardown — so one turn id
++ * current value (it is NOT reset to ""). Only a matching EVT_END clears it after
++ * its callback; delayed old BREAK/END events preserve it. Teardown also clears it.
++ * Thus one turn id
+  * persists across that turn's audio/text packets and never leaks into the next. */
+ static void latch_event_id(tai_ctx_t *ctx,
+@@ -508,5 +509,5 @@
+
+ static void emit_event(tai_ctx_t *ctx, uint16_t event_type,
+-                       const uint8_t *data, size_t len)
++                       const uint8_t *data, size_t len, const char *event_id)
+ {
+     if (!ctx->on_event) return;
+@@ -515,5 +516,5 @@
+     m.data       = data;
+     m.len        = len;
+-    m.event_id   = ctx->rx_event_id;
++    m.event_id   = event_id;
+     ctx->on_event(ctx, &m, ctx->user_data);
+ }
+@@ -747,12 +748,25 @@
+         }
+
+-        if (evt_type == TAI_EVT_END) {
+-            ctx->event_open = 0;
++        /* A delayed BREAK/END for the previous turn may arrive after START
++         * for the new turn. Deliver its own ID to the callback, but never
++         * replace the new turn's default for ID-less ASR/audio packets. */
++        if (evt_type == TAI_EVT_CHAT_BREAK || evt_type == TAI_EVT_END) {
++            char control_id[sizeof(ctx->rx_event_id)];
++            memcpy(control_id, ctx->rx_event_id, sizeof(control_id));
++            const tai_attr_t *id = tai_attr_find(attrs, attr_count, TAI_ATTR_EVENT_ID);
++            if (id && id->len > 0) {
++                size_t n = id->len < sizeof(control_id) - 1 ? id->len : sizeof(control_id) - 1;
++                memcpy(control_id, id->value, n);
++                control_id[n] = '\0';
++            }
++            if (evt_type == TAI_EVT_END && !strcmp(control_id, ctx->event_id))
++                ctx->event_open = 0;
++            emit_event(ctx, evt_type, evt_data, evt_data_len, control_id);
++            if (evt_type == TAI_EVT_END && !strcmp(control_id, ctx->rx_event_id))
++                ctx->rx_event_id[0] = '\0';
++        } else {
++            latch_event_id(ctx, attrs, attr_count);
++            emit_event(ctx, evt_type, evt_data, evt_data_len, ctx->rx_event_id);
+         }
+-
+-        latch_event_id(ctx, attrs, attr_count);
+-        emit_event(ctx, evt_type, evt_data, evt_data_len);
+-        if (evt_type == TAI_EVT_END)
+-            ctx->rx_event_id[0] = '\0';   /* turn over: clear after firing END */
+         break;
+     }

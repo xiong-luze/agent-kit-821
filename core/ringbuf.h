@@ -9,9 +9,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-void   ringbuf_init(int sample_rate, int seconds);
+int    ringbuf_init(int sample_rate, int seconds);
+void   ringbuf_free(void);
 size_t ringbuf_avail(void);
-void   ringbuf_push(const int16_t *pcm, size_t n);
+size_t ringbuf_push(const int16_t *pcm, size_t n);
 /* 取一帧；不足补静音。返回实际取到的样本数（0 = 空） */
 size_t ringbuf_pop_frame(int16_t *out, size_t frame_samples);
 void   ringbuf_clear(void);
